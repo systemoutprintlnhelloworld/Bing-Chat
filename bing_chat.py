@@ -4,15 +4,21 @@
 from typing import Union
 from fastapi import FastAPI, Request, WebSocket, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import RedirectResponse
 import uvicorn
 import EdgeGPT
 import json
 import re
 
-HOST = '0.0.0.0'
+HOST = '127.0.0.1'
 PORT = 5000
 
 APP = FastAPI()
+
+#将指定网页转发到网站该网址下
+APP.mount("/static", StaticFiles(directory=".\\example"), name="static")
+
 APP.add_middleware(
     CORSMiddleware,
     allow_origins=['*'],
@@ -107,6 +113,10 @@ def error404(request, exc) -> Response:
 @APP.exception_handler(500)
 def error500(request, exc) -> Response:
     return GenerateResponse().error(500, '未知错误')
+# 将首页重定向至该网址（有web.html和web2.html供选择）
+@APP.get("/")
+def home(request: Request):
+    return RedirectResponse(url="/static/web2.html")
 
 @APP.websocket('/ws_stream')
 async def wsStream(ws: WebSocket) -> str:
