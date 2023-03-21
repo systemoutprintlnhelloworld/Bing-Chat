@@ -7,12 +7,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
 import uvicorn
+import asyncio
 import EdgeGPT
+import uuid
+import time
 import json
 import re
 
 HOST = '127.0.0.1'
 PORT = 5000
+COOKIE_FILE_PATH = './cookie.json'
 
 APP = FastAPI()
 
@@ -27,6 +31,7 @@ APP.add_middleware(
     allow_headers=['*'],
 )
 STYLES = ['balanced', 'creative', 'precise']
+CHATBOT = {}
 
 def needReset(data: dict, answer: str) -> bool:
     maxTimes = data.get('item').get('throttling').get('maxNumUserMessagesInConversation')
@@ -106,12 +111,25 @@ async def getrequestParameter(request: Request) -> dict:
             data = await request.json()
     return dict(data)
 
+async def checkToken() -> None:
+    global CHATBOT
+    while True:
+        for token in CHATBOT.copy():
+            if time.time() - CHATBOT[token]['useTime'] > 5 * 60:
+                await CHATBOT[token]['chatBot'].close()
+                del CHATBOT[token]
+        await asyncio.sleep(60)
+
+@APP.on_event('startup')
+async def startup() -> None:
+    asyncio.get_event_loop().create_task(checkToken())
+
 @APP.exception_handler(404)
-def error404(request, exc) -> Response:
+def error404(request: Request, exc: Exception) -> Response:
     return GenerateResponse().error(404, '未找到文件')
 
 @APP.exception_handler(500)
-def error500(request, exc) -> Response:
+def error500(request: Request, exc: Exception) -> Response:
     return GenerateResponse().error(500, '未知错误')
 # 将首页重定向至该网址（有web.html和web2.html供选择）
 @APP.get("/")
@@ -122,7 +140,7 @@ def home(request: Request):
 async def wsStream(ws: WebSocket) -> str:
     await ws.accept()
 
-    chatBot = EdgeGPT.Chatbot('./cookie.json')
+    chatBot = EdgeGPT.Chatbot(COOKIE_FILE_PATH)
     while True:
         try:
             parameters = await ws.receive_json()
@@ -149,7 +167,6 @@ async def wsStream(ws: WebSocket) -> str:
                 if not final:
                     answer = data[index:]
                     index = len(data)
-                    #answer = re.sub(r'\[.*?\]', '', answer)
                     answer = re.sub(r'\[\^.*?\^]', '', answer)
                     if answer:
                         info['answer'] = answer
@@ -186,6 +203,7 @@ async def wsStream(ws: WebSocket) -> str:
 @APP.route('/api', methods=['GET', 'POST'])
 async def api(request: Request) -> Response:
     parameters = await getrequestParameter(request)
+    token = parameters.get('token')
     style = parameters.get('style')
     question = parameters.get('question')
     if not style or not question:
@@ -193,27 +211,43 @@ async def api(request: Request) -> Response:
     elif style not in STYLES:
         return GenerateResponse().error(110, 'style不存在')
     
-    chatBot = EdgeGPT.Chatbot('./cookie.json')
+    global CHATBOT
+    if token in CHATBOT:
+        chatBot = CHATBOT[token]['chatBot']
+        CHATBOT[token]['useTime'] = time.time()
+    else:
+        chatBot = EdgeGPT.Chatbot(COOKIE_FILE_PATH)
+        token = str(uuid.uuid4())
+        CHATBOT[token] = {}
+        CHATBOT[token]['chatBot'] = chatBot
+        CHATBOT[token]['useTime'] = time.time()
     data = await chatBot.ask(question, getStyleEnum(style))
-
+    
     if data.get('item').get('result').get('value') == 'Throttled':
         return GenerateResponse().error(120, '已上限,24小时后尝试')
 
     info = {
         'answer': '',
-        'urls': []
+        'urls': [],
+        'reset': False,
+        'token': token
     }
     answer = re.sub(r'\[\^.*?\^]', '', getAnswer(data))
     answer = answer.rstrip()
     info['answer'] = answer
     info['urls'] = getUrl(data)
+    
+    if needReset(data, answer):
+        await chatBot.reset()
+        info['reset'] = True
+    
     return GenerateResponse().success(info)
     
 @APP.websocket('/ws')
 async def ws(ws: WebSocket) -> str:
     await ws.accept()
 
-    chatBot = EdgeGPT.Chatbot('./cookie.json')
+    chatBot = EdgeGPT.Chatbot(COOKIE_FILE_PATH)
     while True:
         try:
             parameters = await ws.receive_json()
